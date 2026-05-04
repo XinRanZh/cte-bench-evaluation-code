@@ -27,8 +27,8 @@ appear (balances, quantities, clock ticks, etc.) are admitted.
 
 For "surgical impossible-state" studies (where you *want* unreachable
 injections), pass `filter_mode="none"` and the orchestrator will still apply
-the injection but will tag the item as out-of-distribution so reviewers can
-filter in post-hoc analysis.
+the injection but will tag the item as out-of-distribution so downstream
+users can filter it in post-hoc analysis.
 """
 from __future__ import annotations
 from dataclasses import dataclass

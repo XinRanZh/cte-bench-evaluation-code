@@ -1,7 +1,6 @@
 # CTE-Bench Evaluation Code
 
-This repository contains the evaluation code for CTE-Bench-Core-v1,
-prepared for a NeurIPS 2026 Evaluations & Datasets Track submission. It
+This repository contains the evaluation code for CTE-Bench-Core-v1. It
 contains the executable service environments, intervention/oracle code,
 graders, and evaluation scripts.
 

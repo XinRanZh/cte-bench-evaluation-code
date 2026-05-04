@@ -11,7 +11,5 @@ permissively licensed open-source projects:
   behavior, upstream MIT.
 
 `auth`, `bank`, and `cart` are synthetic deterministic services. The
-released benchmark data are licensed CC-BY-4.0; benchmark code is intended
-for MIT-style release. Replace this notice with full project license files
-before camera-ready public hosting if your institution requires a specific
-license template.
+released benchmark data are licensed CC-BY-4.0; benchmark code is released
+under the terms described in `LICENSES.md`.
