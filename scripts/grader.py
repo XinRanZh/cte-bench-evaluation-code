@@ -29,6 +29,11 @@ Four graders, each matching a headline metric:
 
 All graders return small structured dicts. They never raise on malformed
 predictions — parse failures become `{"valid": False, "reason": ...}`.
+
+Infrastructure failures (`is_infrastructure_failure`, `scoring_view`): a call
+that returned a provider or infrastructure error and no model output is
+excluded from every metric's numerator and denominator. Every scorer and
+consumer applies this rule through these two functions.
 """
 from __future__ import annotations
 import json
@@ -388,3 +393,96 @@ def grade_state_probe_v2(predicted_state: Any,
         "fraction_match": (n_match / n_effective) if n_effective else None,
         "per_path": per_path,
     }
+
+
+# ---------------------------------------------------------------------------
+# Infrastructure failures: excluded from scoring.
+
+# Outputs written before explicit `infra_error` records stored a provider
+# exception as "ERR:" followed directly by the exception's dotted class name
+# and ": " (e.g. "ERR:litellm.ServiceUnavailableError: ...", "ERR:litellm.Timeout:
+# ..."). Model text that merely starts with "ERR:" does not have this form.
+LEGACY_EXCEPTION_RE = re.compile(r"^ERR:[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+: ")
+_PHASE_A_COUNTERS = (("n_value_match", "value_match"), ("n_status_match", "status_match"),
+                     ("n_well_formed", "well_formed"))
+
+
+def _calls(row: dict) -> list:
+    return list(row.get("phase_a") or []) + [row[ph] for ph in ("phase_b", "phase_c") if isinstance(row.get(ph), dict)]
+
+
+def _legacy_exception_record(call: dict) -> bool:
+    raw = call.get("raw_excerpt", call.get("raw"))
+    return isinstance(raw, str) and bool(LEGACY_EXCEPTION_RE.match(raw)) and call.get("predicted") is None
+
+
+def _no_billed_output(row: dict) -> bool:
+    """The evaluator bills only calls that returned output, so in a legacy row
+    the exception records are unbilled exactly when the row's billing leaves at
+    least that many calls unbilled. A row without a billing record records no
+    billed output."""
+    b = row.get("billing")
+    if not isinstance(b, dict) or not isinstance(b.get("n_calls"), int):
+        return True
+    calls = _calls(row)
+    return len(calls) - b["n_calls"] >= sum(1 for c in calls if _legacy_exception_record(c))
+
+
+def is_infrastructure_failure(call: Any, row: Any = None) -> bool:
+    """True for a call that returned a provider or infrastructure error and no
+    model output (insufficient balance, service unavailable, timeout, auth).
+
+    The evaluator records such a call explicitly with `infra_error`; for rows it
+    writes (they carry `n_infra_failures`) that record alone decides. Rows of
+    earlier outputs have no explicit record: there a call counts only if its
+    response is the evaluator's exception record (LEGACY_EXCEPTION_RE, no
+    prediction) AND the row's billing shows it unbilled (`row` is required for
+    this fallback). Billed model output is never a failure, even if its text
+    starts with "ERR:"; nor are billed empty responses, refusals or
+    truncations."""
+    if not isinstance(call, dict):
+        return False
+    if call.get("infra_error"):
+        return True
+    if not isinstance(row, dict) or "n_infra_failures" in row:
+        return False
+    return _legacy_exception_record(call) and _no_billed_output(row)
+
+
+def infrastructure_failures(row: Any) -> dict:
+    """Counts of excluded calls in one evaluator output row."""
+    if not isinstance(row, dict):
+        return {"phase_a": 0, "phase_b": 0, "phase_c": 0}
+    return {"phase_a": sum(1 for s in row.get("phase_a") or [] if is_infrastructure_failure(s, row)),
+            "phase_b": int(is_infrastructure_failure(row.get("phase_b"), row)),
+            "phase_c": int(is_infrastructure_failure(row.get("phase_c"), row))}
+
+
+def scoring_view(row: Any) -> Any:
+    """The row as scored, with infrastructure failures removed.
+
+    A row without failures is returned unchanged (the same object). Otherwise
+    a shallow copy is returned in which failed phase-A steps are dropped from
+    `phase_a` and the phase-A counters (`suffix_len`, `n_value_match`,
+    `n_status_match`, `n_well_formed`) no longer count them, a failed phase-B
+    or phase-C record is replaced by None, and `n_infra_excluded` holds the
+    counts. Step indices (`suffix_idx`) are kept, so consumers must align
+    steps to the trace by `suffix_idx`, not by position."""
+    counts = infrastructure_failures(row)
+    if not any(counts.values()):
+        return row
+    out = dict(row)
+    steps = row.get("phase_a") or []
+    failed = [s for s in steps if is_infrastructure_failure(s, row)]
+    out["phase_a"] = [s for s in steps if not is_infrastructure_failure(s, row)]
+    if "suffix_len" in row:
+        out["suffix_len"] = row["suffix_len"] - len(failed)
+    for counter, flag in _PHASE_A_COUNTERS:
+        if counter in row:
+            out[counter] = row[counter] - sum(1 for s in failed if s.get(flag))
+    for ph in ("phase_b", "phase_c"):
+        if counts[ph]:
+            out[ph] = None
+    out["n_infra_excluded"] = counts
+    return out
+

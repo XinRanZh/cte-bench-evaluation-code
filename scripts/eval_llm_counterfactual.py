@@ -35,7 +35,7 @@ Concurrency: per-item sequential (the suffix calls share conversational
 state), but many items can run in parallel via ThreadPoolExecutor.
 """
 from __future__ import annotations
-import argparse, copy, json, os, random, sys, threading, time
+import argparse, copy, hashlib, json, os, random, sys, threading, time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -44,7 +44,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from grader import (parse_json_loose, grade_value_match, grade_status_match,
                     grade_explanation_localization, grade_state_probe,
-                    grade_state_probe_v2, extract_line_number)
+                    grade_state_probe_v2, extract_line_number,
+                    infrastructure_failures, scoring_view)
 from core_v1 import normalize_line_number_convention, normalize_source_text
 from testbeds import TESTBEDS
 
@@ -141,6 +142,116 @@ NEW REQUEST:
 
 Simulate this dependency under the counterfactual. Output ONLY the JSON
 response object this dependency would produce. No prose, no code fences."""
+
+
+# ---------------------------------------------------------------------------
+# Prompt v1.1 (recommended for new evaluations). Same template and the same
+# code path as v1 above, with three wording changes:
+#   (a) source edits: the intervention header reads
+#       "INTERVENTION (in effect for every call after the first {k} observed calls):"
+#       with k = prefix_len;
+#   (b) state and clock edits: the same header with the actual k, and the last
+#       line names steps k and k+1 ("... mutated between step {k} and step {k+1}.");
+#   (c) history: the header explains two labels, and every listed call carries
+#       [original program] (observed call, before the intervention) or
+#       [after intervention] (future call). Numbering and call content are as in v1.
+# Prompt v1 (`make_counterfactual_prompt`) is kept unchanged to reproduce the
+# paper's tables; select the version with --prompt-version.
+
+PROMPT_VERSIONS = ("v1", "v1.1")
+HISTORY_HEADER_V1 = "PRIOR CALL HISTORY (under the counterfactual, in order):"
+HISTORY_HEADER_V1_1 = ("PRIOR CALL HISTORY (in order, numbered from the oldest call shown; "
+                       "[original program] = observed call that ran before the intervention, "
+                       "[after intervention] = call under the counterfactual):")
+TAG_BEFORE = "original program"
+TAG_AFTER = "after intervention"
+
+
+def _header_v1_1(k: int) -> str:
+    return f"INTERVENTION (in effect for every call after the first {k} observed calls):\n"
+
+
+def _fmt_intervention_v1_1(spec: dict) -> str:
+    kind = spec.get("kind")
+    k = spec.get("step_k", "?")
+    if kind in ("threshold_change", "branch_inversion", "quota_change", "adversarial"):
+        return (_header_v1_1(k) +
+                f"  kind: {kind}\n"
+                f"  at source line {spec['line_number']}, the token "
+                f"`{spec['original_span']}` has been replaced by "
+                f"`{spec['modified_span']}`.\n"
+                f"  description: {spec.get('description','')}")
+    if kind in ("state_injection", "clock_jump"):
+        return (_header_v1_1(k) +
+                f"  kind: {kind}\n"
+                f"  at the moment AFTER prefix step {spec.get('step_k','?')} "
+                f"completed, the hidden state path {spec.get('path')} was "
+                f"overwritten from {spec.get('from_value')!r} to "
+                f"{spec.get('to_value')!r}.\n"
+                f"  The SOURCE CODE is unchanged. Only the hidden state was "
+                f"mutated between step {k} and step {k + 1}.")
+    return f"INTERVENTION: {spec}"
+
+
+def _fmt_history_v1_1(calls: list, n_before: int, max_items: int | None = None) -> str:
+    tags = [TAG_BEFORE] * n_before + [TAG_AFTER] * (len(calls) - n_before)
+    pairs = list(zip(calls, tags))
+    if max_items is not None:
+        pairs = pairs[-max_items:]
+    if not pairs:
+        return "(none)"
+    return "\n".join(
+        f"CALL {i+1} [{t}]: {c['op']}({json.dumps(c['args'])}) -> {json.dumps(c['response'])}"
+        for i, (c, t) in enumerate(pairs)
+    )
+
+
+def make_counterfactual_prompt_v1_1(item: dict, suffix_history: list,
+                                    cur_op: str, cur_args: dict,
+                                    strategy: str, window: int) -> str:
+    """Prompt v1.1: `make_counterfactual_prompt` with changes (a), (b), (c)."""
+    kind = item["intervention"].get("kind")
+    if kind in ("state_injection", "clock_jump"):
+        source_code = item.get("source_code")
+    else:
+        source_code = item.get("patched_source") or item.get("source_code")
+    prefix = item["trace_prefix"]
+    if strategy == "prefix_only":
+        prior_all = prefix
+    else:
+        prior_all = prefix + suffix_history
+    n_before = len(prefix)
+    if strategy in ("sliding", "free_rollout"):
+        prior_str = _fmt_history_v1_1(prior_all, n_before, max_items=window)
+    else:
+        prior_str = _fmt_history_v1_1(prior_all, n_before)
+    intervention_block = _fmt_intervention_v1_1({**item["intervention"],
+                                                 "step_k": item["prefix_len"]})
+    return f"""DEPENDENCY SOURCE (possibly patched):
+{source_code}
+
+{intervention_block}
+
+{HISTORY_HEADER_V1_1}
+{prior_str}
+
+NEW REQUEST:
+{cur_op}({json.dumps(cur_args)})
+
+Simulate this dependency under the counterfactual. Output ONLY the JSON
+response object this dependency would produce. No prose, no code fences."""
+
+
+def build_counterfactual_prompt(item: dict, suffix_history: list, cur_op: str, cur_args: dict,
+                                strategy: str, window: int, prompt_version: str = "v1.1") -> str:
+    """Prediction prompt for one future call under the selected prompt version."""
+    if prompt_version == "v1":
+        return make_counterfactual_prompt(item, suffix_history, cur_op, cur_args,
+                                          strategy=strategy, window=window)
+    if prompt_version == "v1.1":
+        return make_counterfactual_prompt_v1_1(item, suffix_history, cur_op, cur_args,
+                                               strategy=strategy, window=window)
+    raise ValueError(f"unknown prompt version {prompt_version!r}; choose from {PROMPT_VERSIONS}")
 
 
 def make_explain_prompt(item: dict) -> str:
@@ -531,7 +642,8 @@ def eval_item(item: dict, model_id: str, strategy: str, window: int,
               thinking_mode: str = "off",
               max_tokens: int = 4000,
               reasoning_effort: str = "high",
-              per_call_logger=None) -> dict:
+              per_call_logger=None,
+              prompt_version: str = "v1.1") -> dict:
     """Evaluate one item across Phase A (suffix trace) + B (localization) +
     C (state probe). If `per_call_logger` is provided it is called with a
     dict after every individual LLM call, so the caller can stream partial
@@ -586,8 +698,9 @@ def eval_item(item: dict, model_id: str, strategy: str, window: int,
 
     for i, step in enumerate(suffix_cf):
         op = step["op"]; args = step["args"]; gt = step["response"]
-        prompt = make_counterfactual_prompt(item, suffix_history, op, args,
-                                            strategy=strategy, window=window)
+        prompt = build_counterfactual_prompt(item, suffix_history, op, args,
+                                             strategy=strategy, window=window,
+                                             prompt_version=prompt_version)
         if os.environ.get("CTE_TRACE"):
             print(f"    [{item.get('item_id','?')[:8]}] suffix {i} op={op} prompt_len={len(prompt)} ... calling",
                   flush=True)
@@ -625,6 +738,9 @@ def eval_item(item: dict, model_id: str, strategy: str, window: int,
             "latency_s": round(dt, 2),
             "prompt_len": len(prompt),
             "raw_excerpt": raw[:160],
+            # a provider/infrastructure error, not a model output: excluded from
+            # scoring (grader.is_infrastructure_failure) and retried on resume
+            **({"infra_error": call_err} if call_err else {}),
         })
         # Stream the call record to disk immediately.
         _emit_call("A", i, op, dt, usage, cost,
@@ -663,7 +779,8 @@ def eval_item(item: dict, model_id: str, strategy: str, window: int,
             pred_line = extract_line_number(raw)
             loc = grade_explanation_localization(pred_line, truth, tolerance=1)
             phase_b = {"raw": raw[:160], "latency_s": round(dt, 2),
-                       "extracted_line": pred_line, **loc}
+                       "extracted_line": pred_line, **loc,
+                       **({"infra_error": call_err} if call_err else {})}
             _emit_call("B", None, "explain", dt, usage, cost,
                        extracted=pred_line, error=call_err)
 
@@ -702,7 +819,8 @@ def eval_item(item: dict, model_id: str, strategy: str, window: int,
                    "n_paths": probe_v1.get("n_paths", 0),
                    "n_match": probe_v1.get("n_match", 0),
                    "fraction_match": probe_v1.get("fraction_match", 0.0),
-                   "v2": probe_v2}
+                   "v2": probe_v2,
+                   **({"infra_error": call_err} if call_err else {})}
         _emit_call("C", None, "state_probe", dt, usage, cost,
                    predicted=parsed, error=call_err)
 
@@ -713,7 +831,7 @@ def eval_item(item: dict, model_id: str, strategy: str, window: int,
     suffix_sm = sum(1 for s in phase_a if s["status_match"])
     first_div = next((s["suffix_idx"] for s in phase_a
                       if not s["value_match"] and s["well_formed"]), None)
-    return {
+    row = {
         "item_id": item.get("item_id"),
         "domain": item["domain"],
         "intervention_kind": kind,
@@ -729,10 +847,149 @@ def eval_item(item: dict, model_id: str, strategy: str, window: int,
         "phase_b": phase_b,
         "phase_c": phase_c,
     }
+    # Counters above count every attempted call; consumers score through
+    # grader.scoring_view, which removes infrastructure failures. The explicit
+    # `infra_error` records are the only source for rows written here.
+    row["n_infra_failures"] = {"phase_a": sum(1 for s in phase_a if s.get("infra_error")),
+                               "phase_b": int(bool((phase_b or {}).get("infra_error"))),
+                               "phase_c": int(bool((phase_c or {}).get("infra_error")))}
+    return row
 
 
 # ---------------------------------------------------------------------------
 # Main
+
+CHECKPOINT_CONFIG_KEY = "_checkpoint_run_config"
+CHECKPOINT_CONFIG_FIELDS = ("model", "strategy", "window", "prompt_version", "suffix_budget",
+                            "thinking", "reasoning_effort", "max_tokens", "explain", "state",
+                            "request_settings", "cf_jsonl_sha256")
+OPENROUTER_ENV = ("OPENROUTER_PROVIDER", "OPENROUTER_QUANTIZATIONS", "OPENROUTER_REASONING_MAX_TOKENS",
+                  "OPENROUTER_REASONING_EFFORT")
+
+
+def request_settings(model_id: str) -> dict:
+    """Effective routing and inference settings that change this run's requests
+    beyond the CLI fields: the environment read by _provider_kwargs/call_llm and
+    the fixed request parameters. Stamped on every row and compared on resume."""
+    s = {"temperature": "provider default", "timeout_s": 1200, "explain_max_tokens": 2000}
+    if model_id.startswith("openrouter/"):
+        s.update({var: os.environ.get(var) or None for var in OPENROUTER_ENV})
+    elif model_id.startswith("deepseek/"):
+        s["route"] = "api.deepseek.com (OpenAI SDK)"
+    else:
+        s["AWS_REGION"] = os.environ.get("AWS_REGION") or "us-east-1"   # litellm / Bedrock routes
+    return s
+
+
+def checkpoint_run_config(args) -> dict:
+    """Configuration that every row of a checkpoint was produced under."""
+    with open(args.cf_jsonl, "rb") as f:
+        cf_sha = hashlib.sha256(f.read()).hexdigest()
+    return {"model": args.model, "strategy": args.strategy, "window": args.window,
+            "prompt_version": args.prompt_version, "suffix_budget": args.suffix_budget,
+            "thinking": args.thinking, "reasoning_effort": args.reasoning_effort,
+            "max_tokens": args.max_tokens, "explain": not args.no_explain,
+            "state": not args.no_state, "request_settings": request_settings(args.model),
+            "cf_jsonl_sha256": cf_sha}
+
+
+CHECKPOINT_MIXED_KEY = "_checkpoint_mixed_run_configurations"
+ROW_CONFIG_KEY = "run_config"
+ROW_ID_KEY = "catalog_row_sha256"   # identity of the catalog row a result answers
+
+
+def config_diffs(stored: dict | None, current: dict) -> list[str]:
+    s = stored if isinstance(stored, dict) else {}
+    return [f"{k}: {s.get(k)!r} vs this run {current.get(k)!r}"
+            for k in CHECKPOINT_CONFIG_FIELDS if s.get(k) != current.get(k)]
+
+
+def checkpoint_mismatch(stored: dict | None, current: dict) -> str | None:
+    """None if a checkpoint header written under `stored` matches `current`."""
+    if stored is None:
+        return "it records no run configuration, so its rows cannot be verified"
+    diffs = config_diffs(stored, current)
+    return ("its run configuration differs (" + "; ".join(diffs) + ")") if diffs else None
+
+
+def read_checkpoint(path: Path) -> tuple[dict | None, dict, list]:
+    """(header run configuration, rows by catalog-row identity, mixed-configuration markers).
+
+    Rows are keyed by `catalog_row_sha256`; a row without it (an older harness)
+    is kept under ("no-identity", item_id, line) so that it is never reused."""
+    header, rows, markers = None, {}, []
+    with path.open() as f:
+        for n, line in enumerate(f):
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if CHECKPOINT_CONFIG_KEY in rec:
+                if header is None:
+                    header = rec[CHECKPOINT_CONFIG_KEY]
+            elif CHECKPOINT_MIXED_KEY in rec:
+                markers.append(rec[CHECKPOINT_MIXED_KEY])
+            elif rec.get("item_id"):
+                key = rec.get(ROW_ID_KEY) or ("no-identity", rec["item_id"], n)
+                rows[key] = rec
+    return header, rows, markers
+
+
+def restored_row_errors(row: dict, item: dict, budget: int) -> list[str]:
+    """Why a checkpoint row cannot stand for the catalog row `item` (empty if it can)."""
+    import score_paired as sp
+    errs = []
+    if row.get("item_id") != item.get("item_id"):
+        errs.append(f"item_id {row.get('item_id')!r} != {item.get('item_id')!r}")
+    try:
+        steps = sp.checked_steps(row, item, budget)
+    except sp.InvalidRunError as e:
+        return errs + [str(e)]
+    trace = item["trace_counterfactual"]
+    if len(steps) != min(budget, len(trace)):
+        errs.append(f"{len(steps)} scored steps instead of {min(budget, len(trace))}")
+    for st in steps:
+        if json.dumps(st.get("ground_truth"), sort_keys=True) != json.dumps(trace[st["suffix_idx"]]["response"],
+                                                                             sort_keys=True):
+            errs.append(f"step {st['suffix_idx']} stores another target than the catalog row")
+            break
+    return errs
+
+
+def checkpoint_problems(header: dict | None, rows: dict, markers: list, current: dict) -> list[str]:
+    """Reasons why reusing this checkpoint's rows under `current` is not a clean resume."""
+    problems = []
+    head = checkpoint_mismatch(header, current)
+    if head:
+        problems.append(head)
+    no_id = [k for k in rows if isinstance(k, tuple)]
+    if no_id:
+        problems.append(f"{len(no_id)} of its {len(rows)} rows carry no catalog-row identity "
+                        f"({ROW_ID_KEY}), so they cannot be matched to scenarios")
+    bad = [(iid, r.get(ROW_CONFIG_KEY)) for iid, r in rows.items()
+           if config_diffs(r.get(ROW_CONFIG_KEY), current) or not isinstance(r.get(ROW_CONFIG_KEY), dict)]
+    if bad:
+        iid, cfg = bad[0]
+        why = ("no recorded run configuration" if not isinstance(cfg, dict)
+               else "; ".join(config_diffs(cfg, current)))
+        problems.append(f"{len(bad)} of its {len(rows)} rows were not produced under this run's "
+                        f"configuration (e.g. {iid}: {why})")
+    if markers:
+        problems.append(f"it is marked as mixing run configurations "
+                        f"({len(markers)} earlier resume(s) with --allow-checkpoint-mismatch)")
+    return problems
+
+
+def row_config_summary(results: list) -> list:
+    """Distinct per-row run configurations with their row counts (None = not recorded)."""
+    counts: dict = {}
+    for r in results:
+        if r is None:
+            continue
+        key = json.dumps(r.get(ROW_CONFIG_KEY), sort_keys=True)
+        counts[key] = counts.get(key, 0) + 1
+    return [{"run_config": json.loads(k), "n_rows": n} for k, n in counts.items()]
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -758,6 +1015,22 @@ def main():
                     help="max_tokens for counterfactual + state-probe calls. "
                          "Thinking models need 12000-20000 so they can finish "
                          "reasoning AND emit the content JSON.")
+    ap.add_argument("--prompt-version", choices=PROMPT_VERSIONS, default="v1.1",
+                    help="Prediction prompt version. v1.1 (default, recommended for new "
+                         "evaluations) differs from v1 in three places: (1) the source-edit "
+                         "header states that the intervention is in effect for every call "
+                         "after the first k observed calls; (2) the state/clock header uses "
+                         "the same wording and its boundary sentence names steps k and k+1; "
+                         "(3) the history header is revised and each history call is "
+                         "labelled [original program] or [after intervention]. v1 "
+                         "reproduces the paper's tables. Report the version with every score.")
+    ap.add_argument("--allow-checkpoint-mismatch", action="store_true",
+                    help="Resume from a checkpoint whose header or rows were not all "
+                         "produced under this run's configuration (prompt version, protocol, "
+                         "window, model, catalog, ...). Without this flag such a checkpoint "
+                         "is rejected. With it, the checkpoint is permanently marked as mixed, "
+                         "every row keeps its own run_config, and the output sets "
+                         "mixed_run_configurations=true.")
     ap.add_argument("--out", required=True)
     ap.add_argument("--calls-dir", default=None,
                     help="If set, stream every LLM call as a jsonl line to "
@@ -782,27 +1055,51 @@ def main():
     if not items:
         print("no items to evaluate")
         return
+    import run_provenance as _rp
+    # Identity of each catalog row (computed before evaluation mutates the item).
+    item_uids = [_rp.catalog_row_id(it) for it in items]
+    catalog_rows = {uid: json.loads(json.dumps(it)) for uid, it in zip(item_uids, items)}
 
     # Checkpoint support: every N items we flush partial results next to the
     # output path. On restart we read them back in and skip already-done items.
-    # The ckpt JSONL is keyed by item_id so restart order doesn't matter.
+    # The ckpt JSONL is keyed by catalog-row identity, so restart order does not matter.
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     ckpt_path = out_path.with_suffix(out_path.suffix + ".ckpt.jsonl")
+    # The run configuration is the first line of every checkpoint and is stamped
+    # on every row (`run_config`). A resume reuses rows only if the header and
+    # every row match this run and the checkpoint carries no mixed-configuration
+    # marker; --allow-checkpoint-mismatch overrides this, records a durable
+    # marker in the checkpoint, and the output then reports the mixture.
+    run_config = checkpoint_run_config(args)
     done_by_id: dict = {}
-    if ckpt_path.exists():
-        with ckpt_path.open() as f:
-            for line in f:
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if rec.get("item_id"):
-                    done_by_id[rec["item_id"]] = rec
+    ckpt_markers: list = []
+    ckpt_problems: list = []
+    ckpt_has_content = ckpt_path.exists() and ckpt_path.stat().st_size > 0
+    if ckpt_has_content:
+        header, done_by_id, ckpt_markers = read_checkpoint(ckpt_path)
+        # A restored row must answer exactly its catalog row; otherwise it is never reused.
+        broken = []
+        for uid, row in done_by_id.items():
+            if uid in catalog_rows:
+                errs = restored_row_errors(row, catalog_rows[uid], args.suffix_budget)
+                if errs:
+                    broken.append(f"{row.get('item_id')}: {'; '.join(errs)}")
+        if broken:
+            raise SystemExit(f"error: checkpoint {ckpt_path} holds rows that do not answer their catalog rows "
+                             f"({len(broken)}; e.g. {broken[0]}). Delete the checkpoint or use another --out.")
+        ckpt_problems = checkpoint_problems(header, done_by_id, ckpt_markers, run_config)
+        if ckpt_problems:
+            msg = (f"checkpoint {ckpt_path} cannot be resumed: " + "; ".join(ckpt_problems) +
+                   ". Use another --out, delete the checkpoint, or pass --allow-checkpoint-mismatch.")
+            if not args.allow_checkpoint_mismatch:
+                raise SystemExit(f"error: {msg}")
+            print(f"[resume] WARNING (--allow-checkpoint-mismatch): {msg}")
         print(f"[resume] loaded {len(done_by_id)} items from {ckpt_path.name}")
+    mixed_run = bool(ckpt_problems)
 
     print(f"evaluating {len(items)} items with model={args.model} "
-          f"strategy={args.strategy} window={args.window}")
+          f"strategy={args.strategy} window={args.window} prompt={args.prompt_version}")
 
     total_bill = {"prompt_tokens": 0, "completion_tokens": 0,
                   "reasoning_tokens": 0, "cached_tokens": 0,
@@ -811,21 +1108,35 @@ def main():
     results: list = [None] * len(items)
     # Pre-fill results with checkpoint hits and accumulate their billing.
     pending_idxs = []
+    retried_bill = {k: 0 for k in total_bill}
+    n_retried = 0
     for i, it in enumerate(items):
-        iid = it.get("item_id")
-        if iid and iid in done_by_id:
-            results[i] = done_by_id[iid]
+        row = done_by_id.get(item_uids[i])
+        if row is not None and any(infrastructure_failures(row).values()):
+            # a call of this row failed for infrastructure reasons: evaluate it again
+            n_retried += 1
+            for k in retried_bill:
+                retried_bill[k] += (row.get("billing", {}) or {}).get(k, 0) or 0
+            row = None
+        if row is not None:
+            results[i] = row
             b = results[i].get("billing", {}) or {}
             for k in total_bill:
                 total_bill[k] += b.get(k, 0) or 0
         else:
             pending_idxs.append(i)
-    print(f"[resume] {len(pending_idxs)} items pending "
-          f"(restored total=${total_bill['cost_usd']:.2f})")
+    print(f"[resume] {len(pending_idxs)} items pending, {n_retried} of them retried after infrastructure "
+          f"failures (restored total=${total_bill['cost_usd']:.2f})")
 
     # Open checkpoint log in append mode; fsync after each write so a kill
-    # can't lose the last item.
+    # can't lose the last item. A new checkpoint starts with the run configuration.
     ckpt_f = ckpt_path.open("a")
+    if not ckpt_has_content:
+        ckpt_f.write(json.dumps({CHECKPOINT_CONFIG_KEY: run_config}) + "\n")
+    if mixed_run:
+        ckpt_f.write(json.dumps({CHECKPOINT_MIXED_KEY: {
+            "ts": time.time(), "run_config": run_config, "problems": ckpt_problems}}) + "\n")
+    ckpt_f.flush()
 
     # Per-call streaming logger: one JSON line per LLM call, flushed + fsync'd
     # the moment the call returns. This is independent of item-level ckpt
@@ -859,12 +1170,15 @@ def main():
                              not args.no_explain, not args.no_state,
                              args.thinking, args.max_tokens,
                              args.reasoning_effort,
-                             per_call_logger)] = i
+                             per_call_logger,
+                             prompt_version=args.prompt_version)] = i
         for fut in as_completed(futs):
             i = futs[fut]
             try:
                 results[i] = fut.result()
                 r = results[i]
+                r[ROW_CONFIG_KEY] = run_config
+                r[ROW_ID_KEY] = item_uids[i]
                 b = r.get("billing", {}) or {}
                 for k in total_bill:
                     total_bill[k] += b.get(k, 0) or 0
@@ -893,7 +1207,8 @@ def main():
                       flush=True)
             except Exception as e:
                 print(f"  item {i} FAILED: {e}", flush=True)
-                results[i] = {"item_id": items[i].get("item_id"), "error": str(e)}
+                results[i] = {"item_id": items[i].get("item_id"), "error": str(e),
+                              ROW_CONFIG_KEY: run_config, ROW_ID_KEY: item_uids[i]}
 
     ckpt_f.close()
     if calls_f is not None:
@@ -909,6 +1224,7 @@ def main():
     for r in results:
         if r is None or "error" in r:
             continue
+        r = scoring_view(r)   # infrastructure failures are not scored
         key = f"{r['domain']}::{r['intervention_kind']}"
         a = agg_dk[key]
         a["n"] += 1
@@ -927,16 +1243,27 @@ def main():
             a["state_paths"] += r["phase_c"]["n_paths"]
             a["state_match"] += r["phase_c"]["n_match"]
 
+    infra_rows = [r for r in results if r and "error" not in r and any(infrastructure_failures(r).values())]
+    infra_summary = {"rows": len(infra_rows),
+                     **{k: sum(infrastructure_failures(r)[k] for r in infra_rows) for k in ("phase_a", "phase_b", "phase_c")},
+                     "note": "excluded from scoring; rerun the same command to retry these rows"}
     out_path.write_text(json.dumps({
         "model": args.model,
         "strategy": args.strategy,
         "window": args.window,
+        "prompt_version": args.prompt_version,
+        "run_config": run_config,
+        "mixed_run_configurations": mixed_run,
+        **({"checkpoint_problems": ckpt_problems,
+            "row_run_configurations": row_config_summary(results)} if mixed_run else {}),
         "thinking": args.thinking,
         "reasoning_effort": args.reasoning_effort,
         "max_items": args.max_items,
         "suffix_budget": args.suffix_budget,
         "n_items": len(items),
         "billing_total": total_bill,
+        **({"billing_of_retried_rows": retried_bill} if n_retried else {}),
+        "infrastructure_failures": infra_summary,
         "per_item": results,
         "aggregate_by_domain_kind": dict(agg_dk),
     }, indent=2, default=str))
@@ -947,6 +1274,13 @@ def main():
     print(f"  output:    {total_bill['completion_tokens']:,} tokens "
           f"(reasoning {total_bill['reasoning_tokens']:,})")
     print(f"  TOTAL:     ${total_bill['cost_usd']:.4f}")
+    if infra_rows:
+        print(f"  NOTE: {len(infra_rows)} row(s) have calls that failed with a provider error; they are "
+              f"excluded from scoring and retried when the same command is run again")
+    if mixed_run:
+        print(f"  NOTE: this output mixes rows from "
+              f"{len(row_config_summary(results))} run configuration(s) "
+              f"(mixed_run_configurations=true; each row carries its run_config)")
     print(f"\nwrote {out_path}")
 
 

@@ -9,7 +9,7 @@ lock table is well-defined. Directory / file / empty-directory error names
 mirror upstream fs.errors.
 
 Upstream reference: https://github.com/PyFilesystem/pyfilesystem2
-License: MIT (upstream). This port: research benchmark only.
+License: MIT (upstream; see THIRD_PARTY_NOTICES.md). Intended use: research benchmarking (no added restriction).
 
 Invariants:
   INV-1: a locked inode can only be released by its holder, and exactly once

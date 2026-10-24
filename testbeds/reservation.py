@@ -7,7 +7,7 @@ to a self-contained module without Django ORM. The guarded threshold
 OSCAR_MAX_BASKET_QUANTITY_THRESHOLD is preserved verbatim as MAX_ALLOWED_QUANTITY.
 
 Upstream reference: https://github.com/django-oscar/django-oscar
-License: BSD 3-Clause (upstream). This port: research benchmark only.
+License: BSD 3-Clause (upstream; see THIRD_PARTY_NOTICES.md). Intended use: research benchmarking (no added restriction).
 
 We add a reservation-lifecycle layer on top of the basket: holds expire on a
 logical clock, matching how a real booking platform (events, hotels, airlines)

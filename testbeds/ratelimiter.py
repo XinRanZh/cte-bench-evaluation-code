@@ -6,7 +6,7 @@ limits/storage/memory.py incr / get / acquire_sliding_window_entry, and
 limits/strategies.py fixed-window semantics, adapted to a logical clock.
 
 Upstream reference: https://github.com/alisaifee/limits
-License: MIT (upstream). This port: research benchmark only.
+License: MIT (upstream; see THIRD_PARTY_NOTICES.md). Intended use: research benchmarking (no added restriction).
 
 The wall-clock time.time() in upstream is replaced by an explicit logical clock
 so that counterfactual do(clock <- t') is well-defined. Sliding-window weighting
